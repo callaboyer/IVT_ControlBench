@@ -2,21 +2,26 @@
 """
 Experiment 1: PPO for lightweight IVT fed-batch control.
 
-Goal:
-    Test whether standard PPO can outperform simple IVT operating strategies
-    for dynamic NTP/Mg2+ feed and endpoint control.
-
-This is intentionally a lightweight, biologically motivated benchmark,
-not a validated mechanistic IVT model.
+This script includes:
+- Vectorized IVTControlEnv-v0
+- Fixed batch baseline
+- Fixed fed-batch baseline
+- Threshold heuristic baseline
+- Standard discrete-action PPO
+- Evaluation metrics
+- Representative trajectory plots
 
 Dependencies:
     pip install torch numpy matplotlib
 
-Example:
-    python experiment1_ivt_ppo.py --mode all --total-steps 500000 --num-envs 512
+Smoke test:
+    python experiment1_ivt_ppo.py --mode smoke
 
 MacBook Air:
     python experiment1_ivt_ppo.py --mode all --total-steps 200000 --num-envs 128 --device cpu
+
+GTX 1080 Ti:
+    python experiment1_ivt_ppo.py --mode all --total-steps 500000 --num-envs 512 --device cuda
 """
 
 from __future__ import annotations
@@ -35,11 +40,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.distributions import Categorical
-
-
-# -----------------------------
-# Configs
-# -----------------------------
 
 
 @dataclass
@@ -70,6 +70,8 @@ class EnvConfig:
     precip_threshold: float = 0.40
     ppi_safe: float = 1.20
     mg_ppi_safe: float = 0.80
+    mg_high_safe: float = 1.20
+    k_mgppi_inhib: float = 0.50
 
     # pH model.
     ph_optimum: float = 7.50
@@ -81,17 +83,20 @@ class EnvConfig:
     degradation_base: float = 0.0005
     degradation_stress_scale: float = 0.010
 
-    # Dense reward.
+    # Dense reward. These are intentionally stronger than the first draft
+    # so PPO cannot win simply by feeding NTP/Mg to the cap.
     alpha_yield: float = 1.0
-    cost_ntp: float = 0.020
-    cost_mg: float = 0.018
+    cost_ntp: float = 0.050
+    cost_mg: float = 0.050
     cost_time: float = 0.002
-    penalty_stress: float = 0.015
+    penalty_stress: float = 0.035
 
     # Terminal reward.
     terminal_scale: float = 6.0
+    terminal_ntp_cost: float = 0.05
+    terminal_mg_cost: float = 0.08
     lambda_ppi_quality: float = 0.15
-    lambda_mgppi_quality: float = 0.20
+    lambda_mgppi_quality: float = 0.60
     lambda_ph_quality: float = 0.20
 
 
@@ -110,11 +115,6 @@ class PPOConfig:
     value_coef: float = 0.50
     max_grad_norm: float = 0.50
     hidden_size: int = 64
-
-
-# -----------------------------
-# Vectorized IVT Environment
-# -----------------------------
 
 
 class IVTVectorEnv:
@@ -177,6 +177,7 @@ class IVTVectorEnv:
         self.params: Dict[str, torch.Tensor] = {}
 
         self.action_table = self._make_action_table().to(device)
+
         self.ntp_feed_amounts = torch.tensor(
             [0.0, cfg.ntp_low_feed, cfg.ntp_high_feed],
             dtype=torch.float32,
@@ -203,6 +204,21 @@ class IVTVectorEnv:
     def action_index(ntp_level: int, mg_level: int, stop: int) -> int:
         return (ntp_level * 3 + mg_level) * 2 + stop
 
+    def _ensure_params_exist(self) -> None:
+        names = [
+            "k_cat",
+            "k_deact",
+            "km_ntp",
+            "km_mg",
+            "k_ppi_inhib",
+            "p_trunc_base",
+            "p_trunc_ppi",
+            "precip_rate",
+        ]
+        for name in names:
+            if name not in self.params:
+                self.params[name] = torch.zeros(self.num_envs, device=self.device)
+
     def reset(self, env_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, device=self.device)
@@ -210,6 +226,8 @@ class IVTVectorEnv:
         n = env_ids.numel()
         cfg = self.cfg
         dev = self.device
+
+        self._ensure_params_exist()
 
         # Initial state randomization.
         self.state[env_ids, self.NTP] = uniform(dev, n, 0.80, 1.20)
@@ -227,8 +245,6 @@ class IVTVectorEnv:
         self.total_reward[env_ids] = 0.0
 
         # Per-episode parameter randomization.
-        self._ensure_params_exist()
-
         self.params["k_cat"][env_ids] = cfg.k_cat_nominal * uniform(dev, n, 0.80, 1.20)
         self.params["k_deact"][env_ids] = uniform(dev, n, 0.006, 0.018)
         self.params["km_ntp"][env_ids] = uniform(dev, n, 0.10, 0.30)
@@ -239,21 +255,6 @@ class IVTVectorEnv:
         self.params["precip_rate"][env_ids] = uniform(dev, n, 0.01, 0.08)
 
         return self.get_obs()
-
-    def _ensure_params_exist(self) -> None:
-        names = [
-            "k_cat",
-            "k_deact",
-            "km_ntp",
-            "km_mg",
-            "k_ppi_inhib",
-            "p_trunc_base",
-            "p_trunc_ppi",
-            "precip_rate",
-        ]
-        for name in names:
-            if name not in self.params:
-                self.params[name] = torch.zeros(self.num_envs, device=self.device)
 
     def get_obs(self) -> torch.Tensor:
         cfg = self.cfg
@@ -273,16 +274,21 @@ class IVTVectorEnv:
             ],
             dim=-1,
         )
+
         return obs.clamp(-5.0, 5.0)
 
     @torch.no_grad()
-    def step(self, actions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
+    def step(
+        self,
+        actions: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]:
         cfg = self.cfg
         dt = cfg.dt
         eps = 1e-8
 
         actions = actions.long()
         action_components = self.action_table[actions]
+
         ntp_levels = action_components[:, 0]
         mg_levels = action_components[:, 1]
         stop_signal = action_components[:, 2].bool()
@@ -293,7 +299,7 @@ class IVTVectorEnv:
         s = self.state
         old_full = s[:, self.RNA_FULL].clone()
 
-        # Apply feeds before the reaction step.
+        # Apply feeds before reaction update.
         s[:, self.NTP] = (s[:, self.NTP] + ntp_feed).clamp(0.0, cfg.max_ntp)
         s[:, self.MG] = (s[:, self.MG] + mg_feed).clamp(0.0, cfg.max_mg)
 
@@ -309,13 +315,16 @@ class IVTVectorEnv:
         enzyme = s[:, self.ENZYME]
         ph = s[:, self.PH]
 
-        # Smooth rate factors.
         f_ntp = michaelis_menten(ntp, self.params["km_ntp"])
         f_mg = michaelis_menten(mg, self.params["km_mg"])
         f_ppi = 1.0 / (1.0 + self.params["k_ppi_inhib"] * ppi)
         f_ph = torch.exp(-2.0 * torch.abs(ph - cfg.ph_optimum))
 
-        r_raw = self.params["k_cat"] * enzyme * f_ntp * f_mg * f_ppi * f_ph
+        # Important change: Mg-PPi burden now directly inhibits productive IVT.
+        # This prevents the policy from treating Mg-PPi precipitation as a free PPi sink.
+        f_mgppi = 1.0 / (1.0 + cfg.k_mgppi_inhib * mg_ppi)
+
+        r_raw = self.params["k_cat"] * enzyme * f_ntp * f_mg * f_ppi * f_ph * f_mgppi
 
         # Prevent impossible consumption.
         max_r_by_ntp = 0.95 * ntp / (cfg.ntp_consumption * dt + eps)
@@ -325,6 +334,7 @@ class IVTVectorEnv:
         # Truncation risk increases with PPi and low NTP.
         low_ntp_stress = torch.relu(0.20 - ntp)
         ppi_trunc_signal = ppi / (1.0 + ppi)
+
         p_trunc = (
             self.params["p_trunc_base"]
             + self.params["p_trunc_ppi"] * ppi_trunc_signal
@@ -353,16 +363,19 @@ class IVTVectorEnv:
         # Product degradation under stress.
         ph_stress = torch.relu(torch.abs(new_ph - cfg.ph_optimum) - cfg.ph_safe_deviation)
         ppi_stress = torch.relu(new_ppi - cfg.ppi_safe)
-        degradation_rate = cfg.degradation_base + cfg.degradation_stress_scale * (ph_stress + ppi_stress)
+        mgppi_stress = torch.relu(new_mg_ppi - cfg.mg_ppi_safe)
+
+        degradation_rate = (
+            cfg.degradation_base
+            + cfg.degradation_stress_scale * (ph_stress + ppi_stress + mgppi_stress)
+        )
         degradation_factor = torch.exp(-degradation_rate * dt)
 
         new_full = (full + delta_full) * degradation_factor
         new_trunc = (trunc + delta_trunc) * degradation_factor
 
-        # Enzyme deactivation.
         new_enzyme = enzyme * torch.exp(-self.params["k_deact"] * dt)
 
-        # Clamp and write state.
         s[:, self.NTP] = new_ntp.clamp(0.0, cfg.max_ntp)
         s[:, self.MG] = new_mg.clamp(0.0, cfg.max_mg)
         s[:, self.PPI] = new_ppi.clamp(0.0, cfg.max_ppi)
@@ -374,11 +387,13 @@ class IVTVectorEnv:
 
         self.step_count += 1
 
-        # Dense reward.
         net_delta_full = s[:, self.RNA_FULL] - old_full
+
+        # Important change: high free Mg is directly penalized.
         stress = (
             torch.relu(s[:, self.PPI] - cfg.ppi_safe)
             + torch.relu(s[:, self.MG_PPI] - cfg.mg_ppi_safe)
+            + torch.relu(s[:, self.MG] - cfg.mg_high_safe)
             + torch.relu(torch.abs(s[:, self.PH] - cfg.ph_optimum) - cfg.ph_safe_deviation)
         )
 
@@ -392,11 +407,16 @@ class IVTVectorEnv:
 
         done = stop_signal | (self.step_count >= cfg.horizon)
 
-        # Terminal quality-adjusted reward.
         metrics = self.compute_metrics()
-        terminal_reward = cfg.terminal_scale * metrics["qa_yield"]
-        reward = reward + done.float() * terminal_reward
 
+        # Important change: terminal cumulative feed penalty.
+        terminal_reward = (
+            cfg.terminal_scale * metrics["qa_yield"]
+            - cfg.terminal_ntp_cost * self.total_ntp_fed
+            - cfg.terminal_mg_cost * self.total_mg_fed
+        )
+
+        reward = reward + done.float() * terminal_reward
         self.total_reward += reward
 
         info = {
@@ -466,20 +486,22 @@ def michaelis_menten(x: torch.Tensor, km: torch.Tensor) -> torch.Tensor:
     return x / (km + x + 1e-8)
 
 
-# -----------------------------
-# Baseline policies
-# -----------------------------
-
-
 PolicyFn = Callable[[IVTVectorEnv], torch.Tensor]
 
 
 def fixed_batch_policy(stop_step: int) -> PolicyFn:
     def policy(env: IVTVectorEnv) -> torch.Tensor:
-        stop = (env.step_count >= stop_step).long()
-        actions = torch.full((env.num_envs,), env.action_index(0, 0, 0), device=env.device, dtype=torch.long)
+        stop = env.step_count >= stop_step
+        continue_action = env.action_index(0, 0, 0)
         stop_action = env.action_index(0, 0, 1)
-        actions = torch.where(stop.bool(), torch.full_like(actions, stop_action), actions)
+
+        actions = torch.full(
+            (env.num_envs,),
+            continue_action,
+            device=env.device,
+            dtype=torch.long,
+        )
+        actions = torch.where(stop, torch.full_like(actions, stop_action), actions)
         return actions
 
     return policy
@@ -495,12 +517,19 @@ def fixed_fed_batch_policy(
         should_feed = (env.step_count % feed_interval == 0) & (env.step_count < stop_step)
         should_stop = env.step_count >= stop_step
 
-        ntp = torch.where(should_feed, torch.full_like(env.step_count, ntp_level), torch.zeros_like(env.step_count))
-        mg = torch.where(should_feed, torch.full_like(env.step_count, mg_level), torch.zeros_like(env.step_count))
+        ntp = torch.where(
+            should_feed,
+            torch.full_like(env.step_count, ntp_level),
+            torch.zeros_like(env.step_count),
+        )
+        mg = torch.where(
+            should_feed,
+            torch.full_like(env.step_count, mg_level),
+            torch.zeros_like(env.step_count),
+        )
         stop = should_stop.long()
 
-        actions = ((ntp * 3 + mg) * 2 + stop).long()
-        return actions
+        return ((ntp * 3 + mg) * 2 + stop).long()
 
     return policy
 
@@ -513,30 +542,35 @@ def threshold_policy(
     max_step: int,
     ppi_stop: float = 3.50,
     enzyme_stop: float = 0.25,
+    mgppi_stop: float = 2.50,
 ) -> PolicyFn:
     def policy(env: IVTVectorEnv) -> torch.Tensor:
         s = env.state
+
         ntp_low = s[:, env.NTP] < ntp_threshold
         mg_low = s[:, env.MG] < mg_threshold
 
-        ntp = torch.where(ntp_low, torch.full_like(env.step_count, ntp_level), torch.zeros_like(env.step_count))
-        mg = torch.where(mg_low, torch.full_like(env.step_count, mg_level), torch.zeros_like(env.step_count))
+        ntp = torch.where(
+            ntp_low,
+            torch.full_like(env.step_count, ntp_level),
+            torch.zeros_like(env.step_count),
+        )
+        mg = torch.where(
+            mg_low,
+            torch.full_like(env.step_count, mg_level),
+            torch.zeros_like(env.step_count),
+        )
 
         should_stop = (
             (env.step_count >= max_step)
             | ((s[:, env.PPI] > ppi_stop) & (s[:, env.ENZYME] < enzyme_stop))
+            | (s[:, env.MG_PPI] > mgppi_stop)
         )
-        stop = should_stop.long()
 
-        actions = ((ntp * 3 + mg) * 2 + stop).long()
-        return actions
+        stop = should_stop.long()
+        return ((ntp * 3 + mg) * 2 + stop).long()
 
     return policy
-
-
-# -----------------------------
-# Actor-Critic PPO Model
-# -----------------------------
 
 
 class ActorCritic(nn.Module):
@@ -567,11 +601,6 @@ class ActorCritic(nn.Module):
         return logits, value
 
 
-# -----------------------------
-# Evaluation
-# -----------------------------
-
-
 @torch.no_grad()
 def evaluate_policy(
     cfg: EnvConfig,
@@ -582,10 +611,12 @@ def evaluate_policy(
     seed: int = 123,
 ) -> Dict[str, float]:
     set_global_seeds(seed)
+
     env = IVTVectorEnv(num_envs=num_envs, cfg=cfg, device=device, seed=seed)
     env.reset()
 
     completed = 0
+
     records: Dict[str, List[float]] = {
         "qa_yield": [],
         "rna_full": [],
@@ -608,17 +639,14 @@ def evaluate_policy(
         if done.any():
             done_ids = torch.where(done)[0]
             remaining = num_episodes - completed
-            done_ids = done_ids[:remaining]
+            record_ids = done_ids[:remaining]
 
             for key in records:
-                values = info[key][done_ids].detach().cpu().numpy().tolist()
+                values = info[key][record_ids].detach().cpu().numpy().tolist()
                 records[key].extend(values)
 
-            completed += len(done_ids)
-
-            # Reset all done envs, even if we only recorded part of them.
-            all_done_ids = torch.where(done)[0]
-            env.reset(all_done_ids)
+            completed += len(record_ids)
+            env.reset(done_ids)
 
     out: Dict[str, float] = {}
     for key, vals in records.items():
@@ -634,17 +662,14 @@ def ppo_policy_fn(model: ActorCritic, deterministic: bool = True) -> PolicyFn:
     def policy(env: IVTVectorEnv) -> torch.Tensor:
         obs = env.get_obs()
         logits, _ = model(obs)
+
         if deterministic:
             return torch.argmax(logits, dim=-1)
+
         dist = Categorical(logits=logits)
         return dist.sample()
 
     return policy
-
-
-# -----------------------------
-# Baseline search
-# -----------------------------
 
 
 def search_baselines(
@@ -673,7 +698,15 @@ def search_baselines(
                         f"_interval={interval}_stop={stop_step}"
                     )
                     candidates["fixed_fed_batch"].append(
-                        (name, fixed_fed_batch_policy(ntp_level, mg_level, interval, stop_step))
+                        (
+                            name,
+                            fixed_fed_batch_policy(
+                                ntp_level=ntp_level,
+                                mg_level=mg_level,
+                                feed_interval=interval,
+                                stop_step=stop_step,
+                            ),
+                        )
                     )
 
     for ntp_threshold in [0.20, 0.35, 0.50, 0.65]:
@@ -702,6 +735,7 @@ def search_baselines(
 
     for group, group_candidates in candidates.items():
         print(f"\nSearching {group}: {len(group_candidates)} candidates")
+
         best_score = -float("inf")
         best_tuple: Optional[Tuple[str, PolicyFn, Dict[str, float]]] = None
 
@@ -714,6 +748,7 @@ def search_baselines(
                 num_envs=eval_envs,
                 seed=seed,
             )
+
             score = metrics["qa_yield_mean"]
 
             if score > best_score:
@@ -721,7 +756,10 @@ def search_baselines(
                 best_tuple = (name, policy, metrics)
 
             if i % 20 == 0 or i == len(group_candidates):
-                print(f"  {i:4d}/{len(group_candidates)} searched; best qa_yield={best_score:.4f}")
+                print(
+                    f"  {i:4d}/{len(group_candidates)} searched; "
+                    f"best qa_yield={best_score:.4f}"
+                )
 
         assert best_tuple is not None
         best[group] = best_tuple
@@ -731,11 +769,6 @@ def search_baselines(
         print_metrics(metrics)
 
     return best
-
-
-# -----------------------------
-# PPO Training
-# -----------------------------
 
 
 def train_ppo(
@@ -766,16 +799,36 @@ def train_ppo(
     print(f"  num_envs: {ppo_cfg.num_envs}")
     print(f"  rollout_steps: {ppo_cfg.rollout_steps}")
     print(f"  batch_size: {batch_size}")
+    print(f"  minibatch_size: {minibatch_size}")
     print(f"  num_updates: {num_updates}")
     print(f"  total_steps_actual: {num_updates * batch_size}")
 
     for update in range(1, num_updates + 1):
-        obs_buf = torch.zeros((ppo_cfg.rollout_steps, ppo_cfg.num_envs, env.obs_dim), device=device)
-        actions_buf = torch.zeros((ppo_cfg.rollout_steps, ppo_cfg.num_envs), dtype=torch.long, device=device)
-        logprobs_buf = torch.zeros((ppo_cfg.rollout_steps, ppo_cfg.num_envs), device=device)
-        rewards_buf = torch.zeros((ppo_cfg.rollout_steps, ppo_cfg.num_envs), device=device)
-        dones_buf = torch.zeros((ppo_cfg.rollout_steps, ppo_cfg.num_envs), device=device)
-        values_buf = torch.zeros((ppo_cfg.rollout_steps, ppo_cfg.num_envs), device=device)
+        obs_buf = torch.zeros(
+            (ppo_cfg.rollout_steps, ppo_cfg.num_envs, env.obs_dim),
+            device=device,
+        )
+        actions_buf = torch.zeros(
+            (ppo_cfg.rollout_steps, ppo_cfg.num_envs),
+            dtype=torch.long,
+            device=device,
+        )
+        logprobs_buf = torch.zeros(
+            (ppo_cfg.rollout_steps, ppo_cfg.num_envs),
+            device=device,
+        )
+        rewards_buf = torch.zeros(
+            (ppo_cfg.rollout_steps, ppo_cfg.num_envs),
+            device=device,
+        )
+        dones_buf = torch.zeros(
+            (ppo_cfg.rollout_steps, ppo_cfg.num_envs),
+            device=device,
+        )
+        values_buf = torch.zeros(
+            (ppo_cfg.rollout_steps, ppo_cfg.num_envs),
+            device=device,
+        )
 
         rollout_rewards = []
 
@@ -786,7 +839,7 @@ def train_ppo(
                 actions = dist.sample()
                 logprobs = dist.log_prob(actions)
 
-            next_obs, rewards, dones, info = env.step(actions)
+            next_obs, rewards, dones, _info = env.step(actions)
 
             obs_buf[step] = obs
             actions_buf[step] = actions
@@ -818,8 +871,15 @@ def train_ppo(
                 next_nonterminal = 1.0 - dones_buf[t]
                 next_values = values_buf[t + 1]
 
-            delta = rewards_buf[t] + ppo_cfg.gamma * next_values * next_nonterminal - values_buf[t]
-            last_gae = delta + ppo_cfg.gamma * ppo_cfg.gae_lambda * next_nonterminal * last_gae
+            delta = (
+                rewards_buf[t]
+                + ppo_cfg.gamma * next_values * next_nonterminal
+                - values_buf[t]
+            )
+            last_gae = (
+                delta
+                + ppo_cfg.gamma * ppo_cfg.gae_lambda * next_nonterminal * last_gae
+            )
             advantages[t] = last_gae
 
         returns = advantages + values_buf
@@ -829,9 +889,10 @@ def train_ppo(
         b_old_logprobs = logprobs_buf.reshape(-1)
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
-        b_values = values_buf.reshape(-1)
 
-        b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
+        b_advantages = (
+            b_advantages - b_advantages.mean()
+        ) / (b_advantages.std() + 1e-8)
 
         indices = torch.arange(batch_size, device=device)
 
@@ -853,6 +914,7 @@ def train_ppo(
                 ratio = log_ratio.exp()
 
                 mb_adv = b_advantages[mb_idx]
+
                 pg_loss_unclipped = -mb_adv * ratio
                 pg_loss_clipped = -mb_adv * torch.clamp(
                     ratio,
@@ -876,7 +938,9 @@ def train_ppo(
 
                 with torch.no_grad():
                     approx_kl = ((ratio - 1.0) - log_ratio).mean()
-                    clip_fraction = ((ratio - 1.0).abs() > ppo_cfg.clip_eps).float().mean()
+                    clip_fraction = (
+                        ((ratio - 1.0).abs() > ppo_cfg.clip_eps).float().mean()
+                    )
 
         if update == 1 or update % max(1, num_updates // 10) == 0 or update == num_updates:
             print(
@@ -889,11 +953,6 @@ def train_ppo(
     return model
 
 
-# -----------------------------
-# Trajectory plotting
-# -----------------------------
-
-
 @torch.no_grad()
 def collect_trajectory(
     cfg: EnvConfig,
@@ -902,6 +961,7 @@ def collect_trajectory(
     seed: int = 999,
 ) -> List[Dict[str, float]]:
     set_global_seeds(seed)
+
     env = IVTVectorEnv(num_envs=1, cfg=cfg, device=device, seed=seed)
     env.reset()
 
@@ -939,6 +999,7 @@ def plot_trajectories(
             x = [row["t"] for row in traj]
             y = [row[metric] for row in traj]
             ax.plot(x, y, label=name)
+
         ax.set_title(metric)
         ax.set_xlabel("step")
         ax.grid(True, alpha=0.3)
@@ -947,11 +1008,6 @@ def plot_trajectories(
     fig.tight_layout()
     fig.savefig(out_path, dpi=200)
     plt.close(fig)
-
-
-# -----------------------------
-# Utilities
-# -----------------------------
 
 
 def set_global_seeds(seed: int) -> None:
@@ -967,6 +1023,7 @@ def get_device(name: str) -> torch.device:
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
             return torch.device("mps")
         return torch.device("cpu")
+
     return torch.device(name)
 
 
@@ -982,6 +1039,7 @@ def print_metrics(metrics: Dict[str, float]) -> None:
         "stop_time_mean",
         "total_reward_mean",
     ]
+
     for key in keys:
         if key in metrics:
             print(f"  {key:24s}: {metrics[key]:.4f}")
@@ -1000,15 +1058,15 @@ def save_results_csv(rows: List[Dict[str, float | str]], out_path: str) -> None:
             writer.writerow(row)
 
 
-# -----------------------------
-# Main
-# -----------------------------
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--mode", type=str, default="all", choices=["smoke", "baselines", "train", "all"])
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="all",
+        choices=["smoke", "baselines", "train", "all"],
+    )
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out-dir", type=str, default="ivt_experiment1_outputs")
@@ -1035,8 +1093,8 @@ def main() -> None:
     )
 
     print("Environment config:")
-    for k, v in asdict(env_cfg).items():
-        print(f"  {k}: {v}")
+    for key, value in asdict(env_cfg).items():
+        print(f"  {key}: {value}")
 
     print("\nRun config:")
     print(f"  mode: {args.mode}")
@@ -1046,16 +1104,23 @@ def main() -> None:
 
     if args.mode == "smoke":
         print("\nRunning smoke test.")
+
         env = IVTVectorEnv(num_envs=4, cfg=env_cfg, device=device, seed=args.seed)
         obs = env.reset()
+
         print(f"obs shape: {tuple(obs.shape)}")
+
         for step in range(5):
             actions = torch.randint(0, env.n_actions, (4,), device=device)
             obs, reward, done, info = env.step(actions)
+
             print(
-                f"step={step} reward={reward.detach().cpu().numpy()} "
-                f"done={done.detach().cpu().numpy()} qa={info['qa_yield'].detach().cpu().numpy()}"
+                f"step={step} "
+                f"reward={reward.detach().cpu().numpy()} "
+                f"done={done.detach().cpu().numpy()} "
+                f"qa={info['qa_yield'].detach().cpu().numpy()}"
             )
+
         print("Smoke test complete.")
         return
 
@@ -1072,6 +1137,7 @@ def main() -> None:
         )
 
         print("\nFinal baseline evaluation")
+
         for group, (name, policy, _search_metrics) in best_baselines.items():
             metrics = evaluate_policy(
                 cfg=env_cfg,
@@ -1081,6 +1147,7 @@ def main() -> None:
                 num_envs=args.eval_envs,
                 seed=999,
             )
+
             print(f"\n{group}: {name}")
             print_metrics(metrics)
 
@@ -1123,7 +1190,6 @@ def main() -> None:
         save_results_csv(results, csv_path)
         print(f"\nSaved results to: {csv_path}")
 
-    # Representative trajectories.
     trajectories: Dict[str, List[Dict[str, float]]] = {}
 
     if best_baselines:
