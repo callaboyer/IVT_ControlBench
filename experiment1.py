@@ -2,26 +2,24 @@
 """
 Experiment 1: PPO for lightweight IVT fed-batch control.
 
-This script includes:
-- Vectorized IVTControlEnv-v0
-- Fixed batch baseline
-- Fixed fed-batch baseline
-- Threshold heuristic baseline
-- Standard discrete-action PPO
-- Evaluation metrics
-- Representative trajectory plots
+Version 2 changes:
+- Makes Mg2+ limitation more important.
+- Adds wider episode-to-episode variability so static schedules are less dominant.
+- Adds stronger late-reaction degradation to make endpoint control matter.
+- Keeps the anti-overfeeding fixes: Mg-PPi inhibition, high-Mg stress, cumulative feed penalties.
+- Adds optional action-frequency plots to diagnose PPO behavior.
 
 Dependencies:
     pip install torch numpy matplotlib
 
 Smoke test:
-    python experiment1_ivt_ppo.py --mode smoke
+    python experiment1.py --mode smoke
 
 MacBook Air:
-    python experiment1_ivt_ppo.py --mode all --total-steps 200000 --num-envs 128 --device cpu
+    python experiment1.py --mode all --total-steps 500000 --num-envs 128 --device cpu
 
 GTX 1080 Ti:
-    python experiment1_ivt_ppo.py --mode all --total-steps 500000 --num-envs 512 --device cuda
+    python experiment1.py --mode all --total-steps 2000000 --num-envs 512 --device cuda
 """
 
 from __future__ import annotations
@@ -63,7 +61,10 @@ class EnvConfig:
     # Nominal IVT kinetics.
     k_cat_nominal: float = 0.085
     ntp_consumption: float = 0.55
-    mg_consumption: float = 0.20
+
+    # v2 change: Mg2+ is more likely to become limiting.
+    mg_consumption: float = 0.35
+
     ppi_generation: float = 0.45
 
     # Precipitation / inhibition.
@@ -81,10 +82,13 @@ class EnvConfig:
 
     # Product degradation.
     degradation_base: float = 0.0005
-    degradation_stress_scale: float = 0.010
 
-    # Dense reward. These are intentionally stronger than the first draft
-    # so PPO cannot win simply by feeding NTP/Mg to the cap.
+    # v2 change: stronger late/stress-driven degradation so endpoint control matters.
+    degradation_stress_scale: float = 0.025
+    age_degradation_start_frac: float = 0.70
+    age_degradation_scale: float = 0.020
+
+    # Dense reward. These discourage trivial overfeeding.
     alpha_yield: float = 1.0
     cost_ntp: float = 0.050
     cost_mg: float = 0.050
@@ -204,6 +208,14 @@ class IVTVectorEnv:
     def action_index(ntp_level: int, mg_level: int, stop: int) -> int:
         return (ntp_level * 3 + mg_level) * 2 + stop
 
+    @staticmethod
+    def decode_action_index(action_idx: int) -> Tuple[int, int, int]:
+        stop = action_idx % 2
+        x = action_idx // 2
+        mg = x % 3
+        ntp = x // 3
+        return int(ntp), int(mg), int(stop)
+
     def _ensure_params_exist(self) -> None:
         names = [
             "k_cat",
@@ -229,14 +241,14 @@ class IVTVectorEnv:
 
         self._ensure_params_exist()
 
-        # Initial state randomization.
-        self.state[env_ids, self.NTP] = uniform(dev, n, 0.80, 1.20)
-        self.state[env_ids, self.MG] = uniform(dev, n, 0.60, 1.00)
+        # v2 change: wider initial-condition variability so a single static schedule is less dominant.
+        self.state[env_ids, self.NTP] = uniform(dev, n, 0.50, 1.30)
+        self.state[env_ids, self.MG] = uniform(dev, n, 0.40, 1.10)
         self.state[env_ids, self.PPI] = uniform(dev, n, 0.00, 0.05)
         self.state[env_ids, self.MG_PPI] = 0.0
         self.state[env_ids, self.RNA_FULL] = 0.0
         self.state[env_ids, self.RNA_TRUNC] = 0.0
-        self.state[env_ids, self.ENZYME] = uniform(dev, n, 0.80, 1.20)
+        self.state[env_ids, self.ENZYME] = uniform(dev, n, 0.60, 1.30)
         self.state[env_ids, self.PH] = uniform(dev, n, 7.30, 7.70)
 
         self.step_count[env_ids] = 0
@@ -244,15 +256,15 @@ class IVTVectorEnv:
         self.total_mg_fed[env_ids] = 0.0
         self.total_reward[env_ids] = 0.0
 
-        # Per-episode parameter randomization.
-        self.params["k_cat"][env_ids] = cfg.k_cat_nominal * uniform(dev, n, 0.80, 1.20)
-        self.params["k_deact"][env_ids] = uniform(dev, n, 0.006, 0.018)
-        self.params["km_ntp"][env_ids] = uniform(dev, n, 0.10, 0.30)
-        self.params["km_mg"][env_ids] = uniform(dev, n, 0.05, 0.20)
-        self.params["k_ppi_inhib"][env_ids] = uniform(dev, n, 0.50, 2.00)
-        self.params["p_trunc_base"][env_ids] = uniform(dev, n, 0.03, 0.12)
-        self.params["p_trunc_ppi"][env_ids] = uniform(dev, n, 0.03, 0.10)
-        self.params["precip_rate"][env_ids] = uniform(dev, n, 0.01, 0.08)
+        # v2 change: wider kinetic/process variability to reward adaptive control.
+        self.params["k_cat"][env_ids] = cfg.k_cat_nominal * uniform(dev, n, 0.60, 1.40)
+        self.params["k_deact"][env_ids] = uniform(dev, n, 0.004, 0.030)
+        self.params["km_ntp"][env_ids] = uniform(dev, n, 0.10, 0.35)
+        self.params["km_mg"][env_ids] = uniform(dev, n, 0.05, 0.25)
+        self.params["k_ppi_inhib"][env_ids] = uniform(dev, n, 0.30, 3.00)
+        self.params["p_trunc_base"][env_ids] = uniform(dev, n, 0.03, 0.14)
+        self.params["p_trunc_ppi"][env_ids] = uniform(dev, n, 0.03, 0.12)
+        self.params["precip_rate"][env_ids] = uniform(dev, n, 0.01, 0.10)
 
         return self.get_obs()
 
@@ -268,7 +280,7 @@ class IVTVectorEnv:
                 s[:, self.MG_PPI] / cfg.max_mg_ppi,
                 s[:, self.RNA_FULL] / cfg.max_rna,
                 s[:, self.RNA_TRUNC] / cfg.max_rna,
-                s[:, self.ENZYME] / 1.25,
+                s[:, self.ENZYME] / 1.30,
                 (s[:, self.PH] - cfg.ph_optimum) / 1.0,
                 self.step_count.float() / cfg.horizon,
             ],
@@ -319,9 +331,6 @@ class IVTVectorEnv:
         f_mg = michaelis_menten(mg, self.params["km_mg"])
         f_ppi = 1.0 / (1.0 + self.params["k_ppi_inhib"] * ppi)
         f_ph = torch.exp(-2.0 * torch.abs(ph - cfg.ph_optimum))
-
-        # Important change: Mg-PPi burden now directly inhibits productive IVT.
-        # This prevents the policy from treating Mg-PPi precipitation as a free PPi sink.
         f_mgppi = 1.0 / (1.0 + cfg.k_mgppi_inhib * mg_ppi)
 
         r_raw = self.params["k_cat"] * enzyme * f_ntp * f_mg * f_ppi * f_ph * f_mgppi
@@ -360,20 +369,25 @@ class IVTVectorEnv:
         # pH drift from reaction progress and PPi burden.
         new_ph = ph - dt * cfg.ph_drift_per_rate * r_ivt - dt * cfg.ph_drift_per_ppi * new_ppi
 
-        # Product degradation under stress.
+        # Product degradation under stress and late reaction age.
         ph_stress = torch.relu(torch.abs(new_ph - cfg.ph_optimum) - cfg.ph_safe_deviation)
         ppi_stress = torch.relu(new_ppi - cfg.ppi_safe)
         mgppi_stress = torch.relu(new_mg_ppi - cfg.mg_ppi_safe)
 
+        age_frac = self.step_count.float() / cfg.horizon
+        age_stress = torch.relu(age_frac - cfg.age_degradation_start_frac)
+
         degradation_rate = (
             cfg.degradation_base
             + cfg.degradation_stress_scale * (ph_stress + ppi_stress + mgppi_stress)
+            + cfg.age_degradation_scale * age_stress
         )
         degradation_factor = torch.exp(-degradation_rate * dt)
 
         new_full = (full + delta_full) * degradation_factor
         new_trunc = (trunc + delta_trunc) * degradation_factor
 
+        # Enzyme deactivation remains first-order, but wider reset variability makes it matter more.
         new_enzyme = enzyme * torch.exp(-self.params["k_deact"] * dt)
 
         s[:, self.NTP] = new_ntp.clamp(0.0, cfg.max_ntp)
@@ -389,7 +403,6 @@ class IVTVectorEnv:
 
         net_delta_full = s[:, self.RNA_FULL] - old_full
 
-        # Important change: high free Mg is directly penalized.
         stress = (
             torch.relu(s[:, self.PPI] - cfg.ppi_safe)
             + torch.relu(s[:, self.MG_PPI] - cfg.mg_ppi_safe)
@@ -409,7 +422,6 @@ class IVTVectorEnv:
 
         metrics = self.compute_metrics()
 
-        # Important change: terminal cumulative feed penalty.
         terminal_reward = (
             cfg.terminal_scale * metrics["qa_yield"]
             - cfg.terminal_ntp_cost * self.total_ntp_fed
@@ -685,14 +697,16 @@ def search_baselines(
         "threshold": [],
     }
 
-    for stop_step in [16, 24, 32, 40, 48, 56, 64]:
+    # Stop-time grid expanded to make endpoint-control baselines fairer.
+    for stop_step in [16, 24, 32, 40, 48, 56, 60, 64]:
         name = f"fixed_batch_stop={stop_step}"
         candidates["fixed_batch"].append((name, fixed_batch_policy(stop_step)))
 
+    # Fixed schedule grid includes Mg now that Mg limitation is more important.
     for ntp_level in [1, 2]:
         for mg_level in [0, 1, 2]:
-            for interval in [4, 8, 16]:
-                for stop_step in [32, 48, 64]:
+            for interval in [4, 8, 12, 16]:
+                for stop_step in [32, 40, 48, 56, 60, 64]:
                     name = (
                         f"fixed_feed_ntp={ntp_level}_mg={mg_level}"
                         f"_interval={interval}_stop={stop_step}"
@@ -709,11 +723,11 @@ def search_baselines(
                         )
                     )
 
-    for ntp_threshold in [0.20, 0.35, 0.50, 0.65]:
-        for mg_threshold in [0.15, 0.30, 0.45]:
+    for ntp_threshold in [0.20, 0.35, 0.50, 0.65, 0.80]:
+        for mg_threshold in [0.15, 0.30, 0.45, 0.60]:
             for ntp_level in [1, 2]:
                 for mg_level in [1, 2]:
-                    for max_step in [40, 52, 64]:
+                    for max_step in [40, 48, 56, 64]:
                         name = (
                             f"threshold_ntp={ntp_threshold:.2f}_mg={mg_threshold:.2f}"
                             f"_ntp_level={ntp_level}_mg_level={mg_level}_max={max_step}"
@@ -755,7 +769,7 @@ def search_baselines(
                 best_score = score
                 best_tuple = (name, policy, metrics)
 
-            if i % 20 == 0 or i == len(group_candidates):
+            if i % 40 == 0 or i == len(group_candidates):
                 print(
                     f"  {i:4d}/{len(group_candidates)} searched; "
                     f"best qa_yield={best_score:.4f}"
@@ -793,6 +807,12 @@ def train_ppo(
     batch_size = ppo_cfg.num_envs * ppo_cfg.rollout_steps
     minibatch_size = batch_size // ppo_cfg.minibatches
     num_updates = ppo_cfg.total_steps // batch_size
+
+    if num_updates < 1:
+        raise ValueError(
+            "total_steps must be at least num_envs * rollout_steps. "
+            f"Got total_steps={ppo_cfg.total_steps}, batch_size={batch_size}."
+        )
 
     print("\nPPO training")
     print(f"  device: {device}")
@@ -959,21 +979,23 @@ def collect_trajectory(
     policy_fn: PolicyFn,
     device: torch.device,
     seed: int = 999,
-) -> List[Dict[str, float]]:
+) -> Tuple[List[Dict[str, float]], List[int]]:
     set_global_seeds(seed)
 
     env = IVTVectorEnv(num_envs=1, cfg=cfg, device=device, seed=seed)
     env.reset()
 
     traj = [env.raw_state_dict(0)]
+    actions_taken: List[int] = []
 
     done = torch.tensor([False], device=device)
     while not bool(done[0].item()):
         action = policy_fn(env)
+        actions_taken.append(int(action[0].detach().cpu()))
         _, _, done, _ = env.step(action)
         traj.append(env.raw_state_dict(0))
 
-    return traj
+    return traj, actions_taken
 
 
 def plot_trajectories(
@@ -1003,6 +1025,38 @@ def plot_trajectories(
         ax.set_title(metric)
         ax.set_xlabel("step")
         ax.grid(True, alpha=0.3)
+
+    axes[0].legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+
+def plot_action_trace(
+    actions_by_policy: Dict[str, List[int]],
+    out_path: str,
+) -> None:
+    fig, axes = plt.subplots(3, 1, figsize=(12, 8), sharex=True)
+
+    for name, actions in actions_by_policy.items():
+        t = np.arange(len(actions))
+        decoded = np.asarray([IVTVectorEnv.decode_action_index(a) for a in actions])
+        ntp = decoded[:, 0]
+        mg = decoded[:, 1]
+        stop = decoded[:, 2]
+
+        axes[0].step(t, ntp, where="post", label=name)
+        axes[1].step(t, mg, where="post", label=name)
+        axes[2].step(t, stop, where="post", label=name)
+
+    axes[0].set_ylabel("NTP feed level")
+    axes[1].set_ylabel("Mg feed level")
+    axes[2].set_ylabel("Stop")
+    axes[2].set_xlabel("step")
+
+    for ax in axes:
+        ax.grid(True, alpha=0.3)
+        ax.set_yticks([0, 1, 2])
 
     axes[0].legend(fontsize=8)
     fig.tight_layout()
@@ -1191,28 +1245,38 @@ def main() -> None:
         print(f"\nSaved results to: {csv_path}")
 
     trajectories: Dict[str, List[Dict[str, float]]] = {}
+    actions_by_policy: Dict[str, List[int]] = {}
 
     if best_baselines:
         for group, (_name, policy, _metrics) in best_baselines.items():
-            trajectories[group] = collect_trajectory(
+            traj, actions = collect_trajectory(
                 cfg=env_cfg,
                 policy_fn=policy,
                 device=device,
                 seed=2024,
             )
+            trajectories[group] = traj
+            actions_by_policy[group] = actions
 
     if model is not None:
-        trajectories["ppo"] = collect_trajectory(
+        traj, actions = collect_trajectory(
             cfg=env_cfg,
             policy_fn=ppo_policy_fn(model, deterministic=True),
             device=device,
             seed=2024,
         )
+        trajectories["ppo"] = traj
+        actions_by_policy["ppo"] = actions
 
     if trajectories:
         plot_path = os.path.join(args.out_dir, "representative_trajectories.png")
         plot_trajectories(trajectories, plot_path)
         print(f"Saved representative trajectory plot to: {plot_path}")
+
+    if actions_by_policy:
+        action_plot_path = os.path.join(args.out_dir, "representative_action_trace.png")
+        plot_action_trace(actions_by_policy, action_plot_path)
+        print(f"Saved representative action trace to: {action_plot_path}")
 
     print("\nDone.")
 
