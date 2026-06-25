@@ -2,12 +2,12 @@
 """
 Experiment 1: PPO for lightweight IVT fed-batch control.
 
-Version 2 changes:
-- Makes Mg2+ limitation more important.
-- Adds wider episode-to-episode variability so static schedules are less dominant.
-- Adds stronger late-reaction degradation to make endpoint control matter.
-- Keeps the anti-overfeeding fixes: Mg-PPi inhibition, high-Mg stress, cumulative feed penalties.
-- Adds optional action-frequency plots to diagnose PPO behavior.
+Version 3 changes:
+- Retains v2 state-dependent IVT dynamics and stronger baseline grid.
+- Adds a minimum stop step so PPO cannot collapse to a premature-stop local optimum.
+- Softens Mg2+ feed costs so Mg feeding is learnable without reopening the overfeeding exploit.
+- Keeps anti-overfeeding mechanisms: Mg-PPi inhibition, high-Mg stress, cumulative feed penalties.
+- Includes trajectory and action-trace plots for policy diagnostics.
 
 Dependencies:
     pip install torch numpy matplotlib
@@ -16,10 +16,10 @@ Smoke test:
     python experiment1.py --mode smoke
 
 MacBook Air:
-    python experiment1.py --mode all --total-steps 500000 --num-envs 128 --device cpu
+    python experiment1.py --mode all --total-steps 1500000 --num-envs 128 --device cpu
 
 GTX 1080 Ti:
-    python experiment1.py --mode all --total-steps 2000000 --num-envs 512 --device cuda
+    python experiment1.py --mode all --total-steps 3000000 --num-envs 512 --device cuda
 """
 
 from __future__ import annotations
@@ -43,6 +43,7 @@ from torch.distributions import Categorical
 @dataclass
 class EnvConfig:
     horizon: int = 64
+    min_stop_step: int = 48
     dt: float = 1.0
 
     # Feed amounts in normalized arbitrary units.
@@ -91,14 +92,14 @@ class EnvConfig:
     # Dense reward. These discourage trivial overfeeding.
     alpha_yield: float = 1.0
     cost_ntp: float = 0.050
-    cost_mg: float = 0.050
+    cost_mg: float = 0.035
     cost_time: float = 0.002
     penalty_stress: float = 0.035
 
     # Terminal reward.
     terminal_scale: float = 6.0
     terminal_ntp_cost: float = 0.05
-    terminal_mg_cost: float = 0.08
+    terminal_mg_cost: float = 0.05
     lambda_ppi_quality: float = 0.15
     lambda_mgppi_quality: float = 0.60
     lambda_ph_quality: float = 0.20
@@ -106,7 +107,7 @@ class EnvConfig:
 
 @dataclass
 class PPOConfig:
-    total_steps: int = 500_000
+    total_steps: int = 1_000_000
     num_envs: int = 512
     rollout_steps: int = 64
     ppo_epochs: int = 4
@@ -418,7 +419,12 @@ class IVTVectorEnv:
             - cfg.penalty_stress * stress
         )
 
-        done = stop_signal | (self.step_count >= cfg.horizon)
+        # v3 change: ignore stop actions before the minimum stop step.
+        # This prevents PPO from collapsing to a premature-stop local optimum
+        # while preserving endpoint control after the reaction has progressed.
+        can_stop = self.step_count >= cfg.min_stop_step
+        effective_stop = stop_signal & can_stop
+        done = effective_stop | (self.step_count >= cfg.horizon)
 
         metrics = self.compute_metrics()
 
@@ -697,8 +703,8 @@ def search_baselines(
         "threshold": [],
     }
 
-    # Stop-time grid expanded to make endpoint-control baselines fairer.
-    for stop_step in [16, 24, 32, 40, 48, 56, 60, 64]:
+    # Stop-time grid starts at min_stop_step because earlier stop requests are ignored.
+    for stop_step in [cfg.min_stop_step, 52, 56, 60, 64]:
         name = f"fixed_batch_stop={stop_step}"
         candidates["fixed_batch"].append((name, fixed_batch_policy(stop_step)))
 
@@ -706,7 +712,7 @@ def search_baselines(
     for ntp_level in [1, 2]:
         for mg_level in [0, 1, 2]:
             for interval in [4, 8, 12, 16]:
-                for stop_step in [32, 40, 48, 56, 60, 64]:
+                for stop_step in [cfg.min_stop_step, 52, 56, 60, 64]:
                     name = (
                         f"fixed_feed_ntp={ntp_level}_mg={mg_level}"
                         f"_interval={interval}_stop={stop_step}"
@@ -727,7 +733,7 @@ def search_baselines(
         for mg_threshold in [0.15, 0.30, 0.45, 0.60]:
             for ntp_level in [1, 2]:
                 for mg_level in [1, 2]:
-                    for max_step in [40, 48, 56, 64]:
+                    for max_step in [cfg.min_stop_step, 52, 56, 60, 64]:
                         name = (
                             f"threshold_ntp={ntp_threshold:.2f}_mg={mg_threshold:.2f}"
                             f"_ntp_level={ntp_level}_mg_level={mg_level}_max={max_step}"
@@ -1056,7 +1062,10 @@ def plot_action_trace(
 
     for ax in axes:
         ax.grid(True, alpha=0.3)
-        ax.set_yticks([0, 1, 2])
+
+    axes[0].set_yticks([0, 1, 2])
+    axes[1].set_yticks([0, 1, 2])
+    axes[2].set_yticks([0, 1])
 
     axes[0].legend(fontsize=8)
     fig.tight_layout()
@@ -1125,7 +1134,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--out-dir", type=str, default="ivt_experiment1_outputs")
 
-    parser.add_argument("--total-steps", type=int, default=500_000)
+    parser.add_argument("--total-steps", type=int, default=1_000_000)
     parser.add_argument("--num-envs", type=int, default=512)
     parser.add_argument("--rollout-steps", type=int, default=64)
     parser.add_argument("--eval-episodes", type=int, default=1000)
