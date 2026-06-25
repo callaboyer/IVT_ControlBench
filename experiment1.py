@@ -2,12 +2,12 @@
 """
 Experiment 1: PPO for lightweight IVT fed-batch control.
 
-Version 3 changes:
-- Retains v2 state-dependent IVT dynamics and stronger baseline grid.
-- Adds a minimum stop step so PPO cannot collapse to a premature-stop local optimum.
-- Softens Mg2+ feed costs so Mg feeding is learnable without reopening the overfeeding exploit.
-- Keeps anti-overfeeding mechanisms: Mg-PPi inhibition, high-Mg stress, cumulative feed penalties.
-- Includes trajectory and action-trace plots for policy diagnostics.
+Version 4 changes:
+- Retains v3 state-dependent IVT dynamics, Mg limitation, wider variability, and min-stop timing.
+- Replaces the old 18-action feed+stop-bit space with a cleaner 10-action space:
+  actions 0-8 are feed-only actions; action 9 is a dedicated stop action.
+- Adds PPO action masking so the dedicated stop action cannot be sampled before min_stop_step.
+- This prevents the policy from assigning high probability to stop from the beginning of the episode.
 
 Dependencies:
     pip install torch numpy matplotlib
@@ -141,11 +141,12 @@ class IVTVectorEnv:
 
     Action:
         discrete action representing:
-            ntp_feed in {none, low, high}
-            mg_feed in {none, low, high}
-            stop in {continue, stop}
+            actions 0-8: feed-only actions with
+                ntp_feed in {none, low, high}
+                mg_feed in {none, low, high}
+            action 9: dedicated stop action
 
-        total actions = 3 * 3 * 2 = 18
+        total actions = 10
     """
 
     NTP = 0
@@ -168,7 +169,7 @@ class IVTVectorEnv:
         self.cfg = cfg
         self.device = device
         self.obs_dim = 9
-        self.n_actions = 18
+        self.n_actions = 10
 
         torch.manual_seed(seed)
 
@@ -181,7 +182,8 @@ class IVTVectorEnv:
 
         self.params: Dict[str, torch.Tensor] = {}
 
-        self.action_table = self._make_action_table().to(device)
+        self.feed_action_table = self._make_feed_action_table().to(device)
+        self.stop_action = 9
 
         self.ntp_feed_amounts = torch.tensor(
             [0.0, cfg.ntp_low_feed, cfg.ntp_high_feed],
@@ -197,25 +199,44 @@ class IVTVectorEnv:
         self.reset()
 
     @staticmethod
-    def _make_action_table() -> torch.Tensor:
+    def _make_feed_action_table() -> torch.Tensor:
         rows = []
         for ntp_level in range(3):
             for mg_level in range(3):
-                for stop in range(2):
-                    rows.append([ntp_level, mg_level, stop])
+                rows.append([ntp_level, mg_level])
         return torch.tensor(rows, dtype=torch.long)
 
     @staticmethod
-    def action_index(ntp_level: int, mg_level: int, stop: int) -> int:
-        return (ntp_level * 3 + mg_level) * 2 + stop
+    def feed_action_index(ntp_level: int, mg_level: int) -> int:
+        return ntp_level * 3 + mg_level
+
+    @staticmethod
+    def action_index(ntp_level: int, mg_level: int, stop: int = 0) -> int:
+        # Backwards-compatible helper used by the baselines.
+        # In v4, stop is a dedicated action and no longer carries feed levels.
+        if stop:
+            return 9
+        return ntp_level * 3 + mg_level
 
     @staticmethod
     def decode_action_index(action_idx: int) -> Tuple[int, int, int]:
-        stop = action_idx % 2
-        x = action_idx // 2
-        mg = x % 3
-        ntp = x // 3
-        return int(ntp), int(mg), int(stop)
+        if int(action_idx) == 9:
+            return 0, 0, 1
+        ntp = int(action_idx) // 3
+        mg = int(action_idx) % 3
+        return ntp, mg, 0
+
+    def mask_action_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        # Stop should not be sampled before it can actually terminate the episode.
+        # Because step() increments step_count before checking done, action 9 can
+        # legally stop when current step_count + 1 >= min_stop_step.
+        can_select_stop = (self.step_count + 1) >= self.cfg.min_stop_step
+        return mask_stop_logits_from_pre_step(
+            logits=logits,
+            pre_step_count=self.step_count,
+            horizon=self.cfg.horizon,
+            min_stop_step=self.cfg.min_stop_step,
+        )
 
     def _ensure_params_exist(self) -> None:
         names = [
@@ -300,11 +321,18 @@ class IVTVectorEnv:
         eps = 1e-8
 
         actions = actions.long()
-        action_components = self.action_table[actions]
+        stop_signal = actions == self.stop_action
 
+        feed_actions = torch.clamp(actions, min=0, max=8)
+        action_components = self.feed_action_table[feed_actions]
         ntp_levels = action_components[:, 0]
         mg_levels = action_components[:, 1]
-        stop_signal = action_components[:, 2].bool()
+
+        # Dedicated stop action carries no feed. If a random or external policy
+        # chooses stop before min_stop_step, the environment simply continues
+        # with no feed; PPO itself masks this action during training/evaluation.
+        ntp_levels = torch.where(stop_signal, torch.zeros_like(ntp_levels), ntp_levels)
+        mg_levels = torch.where(stop_signal, torch.zeros_like(mg_levels), mg_levels)
 
         ntp_feed = self.ntp_feed_amounts[ntp_levels]
         mg_feed = self.mg_feed_amounts[mg_levels]
@@ -419,9 +447,8 @@ class IVTVectorEnv:
             - cfg.penalty_stress * stress
         )
 
-        # v3 change: ignore stop actions before the minimum stop step.
-        # This prevents PPO from collapsing to a premature-stop local optimum
-        # while preserving endpoint control after the reaction has progressed.
+        # v4: stop is a dedicated action. The environment still guards against
+        # early external stop actions, while PPO masks them before sampling.
         can_stop = self.step_count >= cfg.min_stop_step
         effective_stop = stop_signal & can_stop
         done = effective_stop | (self.step_count >= cfg.horizon)
@@ -504,14 +531,47 @@ def michaelis_menten(x: torch.Tensor, km: torch.Tensor) -> torch.Tensor:
     return x / (km + x + 1e-8)
 
 
+def mask_stop_logits_from_pre_step(
+    logits: torch.Tensor,
+    pre_step_count: torch.Tensor,
+    horizon: int,
+    min_stop_step: int,
+) -> torch.Tensor:
+    del horizon  # kept for signature symmetry with mask_stop_logits_from_obs
+    masked = logits.clone()
+    can_select_stop = (pre_step_count + 1) >= min_stop_step
+    masked[:, -1] = torch.where(
+        can_select_stop,
+        masked[:, -1],
+        torch.full_like(masked[:, -1], -1.0e9),
+    )
+    return masked
+
+
+def mask_stop_logits_from_obs(
+    logits: torch.Tensor,
+    obs: torch.Tensor,
+    horizon: int,
+    min_stop_step: int,
+) -> torch.Tensor:
+    # The final observation feature is normalized current step_count / horizon.
+    pre_step_count = torch.round(obs[:, -1] * horizon).long()
+    return mask_stop_logits_from_pre_step(
+        logits=logits,
+        pre_step_count=pre_step_count,
+        horizon=horizon,
+        min_stop_step=min_stop_step,
+    )
+
+
 PolicyFn = Callable[[IVTVectorEnv], torch.Tensor]
 
 
 def fixed_batch_policy(stop_step: int) -> PolicyFn:
     def policy(env: IVTVectorEnv) -> torch.Tensor:
         stop = env.step_count >= stop_step
-        continue_action = env.action_index(0, 0, 0)
-        stop_action = env.action_index(0, 0, 1)
+        continue_action = env.feed_action_index(0, 0)
+        stop_action = env.stop_action
 
         actions = torch.full(
             (env.num_envs,),
@@ -547,7 +607,8 @@ def fixed_fed_batch_policy(
         )
         stop = should_stop.long()
 
-        return ((ntp * 3 + mg) * 2 + stop).long()
+        feed_actions = (ntp * 3 + mg).long()
+        return torch.where(should_stop, torch.full_like(feed_actions, env.stop_action), feed_actions)
 
     return policy
 
@@ -586,7 +647,8 @@ def threshold_policy(
         )
 
         stop = should_stop.long()
-        return ((ntp * 3 + mg) * 2 + stop).long()
+        feed_actions = (ntp * 3 + mg).long()
+        return torch.where(should_stop, torch.full_like(feed_actions, env.stop_action), feed_actions)
 
     return policy
 
@@ -680,6 +742,7 @@ def ppo_policy_fn(model: ActorCritic, deterministic: bool = True) -> PolicyFn:
     def policy(env: IVTVectorEnv) -> torch.Tensor:
         obs = env.get_obs()
         logits, _ = model(obs)
+        logits = env.mask_action_logits(logits)
 
         if deterministic:
             return torch.argmax(logits, dim=-1)
@@ -861,6 +924,7 @@ def train_ppo(
         for step in range(ppo_cfg.rollout_steps):
             with torch.no_grad():
                 logits, value = model(obs)
+                logits = env.mask_action_logits(logits)
                 dist = Categorical(logits=logits)
                 actions = dist.sample()
                 logprobs = dist.log_prob(actions)
@@ -932,6 +996,12 @@ def train_ppo(
                 mb_idx = perm[start : start + minibatch_size]
 
                 logits, new_values = model(b_obs[mb_idx])
+                logits = mask_stop_logits_from_obs(
+                    logits=logits,
+                    obs=b_obs[mb_idx],
+                    horizon=cfg.horizon,
+                    min_stop_step=cfg.min_stop_step,
+                )
                 dist = Categorical(logits=logits)
                 new_logprobs = dist.log_prob(b_actions[mb_idx])
                 entropy = dist.entropy().mean()
