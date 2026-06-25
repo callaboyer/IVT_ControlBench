@@ -2,12 +2,11 @@
 """
 Experiment 1: PPO for lightweight IVT fed-batch control.
 
-Version 4 changes:
-- Retains v3 state-dependent IVT dynamics, Mg limitation, wider variability, and min-stop timing.
-- Replaces the old 18-action feed+stop-bit space with a cleaner 10-action space:
-  actions 0-8 are feed-only actions; action 9 is a dedicated stop action.
-- Adds PPO action masking so the dedicated stop action cannot be sampled before min_stop_step.
-- This prevents the policy from assigning high probability to stop from the beginning of the episode.
+Version 5 changes:
+- Retains the v5 10-action space with a dedicated masked stop action.
+- Softens Mg feed costs so PPO is more willing to use Mg when it is limiting.
+- Adds a terminal unused-capacity penalty for voluntary stopping while enzyme/substrate capacity remains.
+- This discourages the previous conservative local optimum: feed NTP, avoid Mg, and stop at min_stop_step.
 
 Dependencies:
     pip install torch numpy matplotlib
@@ -92,14 +91,19 @@ class EnvConfig:
     # Dense reward. These discourage trivial overfeeding.
     alpha_yield: float = 1.0
     cost_ntp: float = 0.050
-    cost_mg: float = 0.035
+    cost_mg: float = 0.025
     cost_time: float = 0.002
     penalty_stress: float = 0.035
 
     # Terminal reward.
     terminal_scale: float = 6.0
     terminal_ntp_cost: float = 0.05
-    terminal_mg_cost: float = 0.05
+    terminal_mg_cost: float = 0.035
+
+    # v5 change: penalize voluntarily stopping while productive capacity remains.
+    # This makes endpoint control state-dependent rather than rewarding the first legal stop.
+    stop_unused_capacity_penalty: float = 0.75
+
     lambda_ppi_quality: float = 0.15
     lambda_mgppi_quality: float = 0.60
     lambda_ph_quality: float = 0.20
@@ -213,7 +217,7 @@ class IVTVectorEnv:
     @staticmethod
     def action_index(ntp_level: int, mg_level: int, stop: int = 0) -> int:
         # Backwards-compatible helper used by the baselines.
-        # In v4, stop is a dedicated action and no longer carries feed levels.
+        # In v5, stop is a dedicated action and no longer carries feed levels.
         if stop:
             return 9
         return ntp_level * 3 + mg_level
@@ -447,7 +451,7 @@ class IVTVectorEnv:
             - cfg.penalty_stress * stress
         )
 
-        # v4: stop is a dedicated action. The environment still guards against
+        # v5: stop is a dedicated action. The environment still guards against
         # early external stop actions, while PPO masks them before sampling.
         can_stop = self.step_count >= cfg.min_stop_step
         effective_stop = stop_signal & can_stop
@@ -455,10 +459,20 @@ class IVTVectorEnv:
 
         metrics = self.compute_metrics()
 
+        unused_capacity = (
+            s[:, self.ENZYME]
+            * torch.minimum(s[:, self.NTP], s[:, self.MG])
+        )
+
+        voluntary_early_stop = effective_stop & (self.step_count < cfg.horizon)
+
         terminal_reward = (
             cfg.terminal_scale * metrics["qa_yield"]
             - cfg.terminal_ntp_cost * self.total_ntp_fed
             - cfg.terminal_mg_cost * self.total_mg_fed
+            - voluntary_early_stop.float()
+            * cfg.stop_unused_capacity_penalty
+            * unused_capacity
         )
 
         reward = reward + done.float() * terminal_reward
