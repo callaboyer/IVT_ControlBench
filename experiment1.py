@@ -2,7 +2,7 @@
 """
 Experiment 1: PPO for lightweight IVT fed-batch control.
 
-Version 6 changes:
+Version 7 changes:
 - Retains the v5 10-action space with a dedicated masked stop action.
 - Softens Mg feed costs so PPO is more willing to use Mg when it is limiting.
 - Adds a terminal unused-capacity penalty for voluntary stopping while enzyme/substrate capacity remains.
@@ -72,6 +72,11 @@ class EnvConfig:
     ppi_safe: float = 1.20
     mg_ppi_safe: float = 0.80
     mg_high_safe: float = 1.20
+
+    # v7 change: discourage solving the task by flooding NTP to the cap.
+    ntp_high_safe: float = 1.50
+    penalty_ntp_high: float = 0.015
+
     k_mgppi_inhib: float = 0.50
 
     # pH model.
@@ -100,7 +105,10 @@ class EnvConfig:
     terminal_ntp_cost: float = 0.05
     terminal_mg_cost: float = 0.035
 
-    # v6 change: penalize voluntarily stopping while productive capacity remains.
+    # v7 change: penalize unused terminal NTP to improve reagent efficiency.
+    terminal_unused_ntp_cost: float = 0.04
+
+    # v6/v7: penalize voluntarily stopping while productive capacity remains.
     # This makes endpoint control state-dependent rather than rewarding the first legal stop.
     stop_unused_capacity_penalty: float = 1.25
 
@@ -217,7 +225,7 @@ class IVTVectorEnv:
     @staticmethod
     def action_index(ntp_level: int, mg_level: int, stop: int = 0) -> int:
         # Backwards-compatible helper used by the baselines.
-        # In v6, stop is a dedicated action and no longer carries feed levels.
+        # In v7, stop is a dedicated action and no longer carries feed levels.
         if stop:
             return 9
         return ntp_level * 3 + mg_level
@@ -436,6 +444,8 @@ class IVTVectorEnv:
 
         net_delta_full = s[:, self.RNA_FULL] - old_full
 
+        ntp_high_stress = torch.relu(s[:, self.NTP] - cfg.ntp_high_safe)
+
         stress = (
             torch.relu(s[:, self.PPI] - cfg.ppi_safe)
             + torch.relu(s[:, self.MG_PPI] - cfg.mg_ppi_safe)
@@ -449,9 +459,10 @@ class IVTVectorEnv:
             - cfg.cost_mg * mg_feed
             - cfg.cost_time
             - cfg.penalty_stress * stress
+            - cfg.penalty_ntp_high * ntp_high_stress
         )
 
-        # v6: stop is a dedicated action. The environment still guards against
+        # v7: stop is a dedicated action. The environment still guards against
         # early external stop actions, while PPO masks them before sampling.
         can_stop = self.step_count >= cfg.min_stop_step
         effective_stop = stop_signal & can_stop
@@ -470,6 +481,7 @@ class IVTVectorEnv:
             cfg.terminal_scale * metrics["qa_yield"]
             - cfg.terminal_ntp_cost * self.total_ntp_fed
             - cfg.terminal_mg_cost * self.total_mg_fed
+            - cfg.terminal_unused_ntp_cost * s[:, self.NTP]
             - voluntary_early_stop.float()
             * cfg.stop_unused_capacity_penalty
             * unused_capacity
