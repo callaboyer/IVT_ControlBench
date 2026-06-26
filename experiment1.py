@@ -2,7 +2,7 @@
 """
 Experiment 1: PPO for lightweight IVT fed-batch control.
 
-Version 7 changes:
+Version 8 changes:
 - Retains the v5 10-action space with a dedicated masked stop action.
 - Softens Mg feed costs so PPO is more willing to use Mg when it is limiting.
 - Adds a terminal unused-capacity penalty for voluntary stopping while enzyme/substrate capacity remains.
@@ -15,7 +15,7 @@ Smoke test:
     python experiment1.py --mode smoke
 
 MacBook Air:
-    python experiment1.py --mode all --total-steps 1500000 --num-envs 128 --device cpu
+    python experiment1py --mode all --total-steps 1500000 --num-envs 128 --device cpu
 
 GTX 1080 Ti:
     python experiment1.py --mode all --total-steps 3000000 --num-envs 512 --device cuda
@@ -63,7 +63,7 @@ class EnvConfig:
     ntp_consumption: float = 0.55
 
     # v2 change: Mg2+ is more likely to become limiting.
-    mg_consumption: float = 0.35
+    mg_consumption: float = 0.45
 
     ppi_generation: float = 0.45
 
@@ -73,9 +73,9 @@ class EnvConfig:
     mg_ppi_safe: float = 0.80
     mg_high_safe: float = 1.20
 
-    # v7 change: discourage solving the task by flooding NTP to the cap.
-    ntp_high_safe: float = 1.50
-    penalty_ntp_high: float = 0.015
+    # v8 change: discourage solving the task by flooding NTP to the cap.
+    ntp_high_safe: float = 1.75
+    penalty_ntp_high: float = 0.005
 
     k_mgppi_inhib: float = 0.50
 
@@ -105,10 +105,10 @@ class EnvConfig:
     terminal_ntp_cost: float = 0.05
     terminal_mg_cost: float = 0.035
 
-    # v7 change: penalize unused terminal NTP to improve reagent efficiency.
-    terminal_unused_ntp_cost: float = 0.04
+    # v8 change: penalize unused terminal NTP to improve reagent efficiency.
+    terminal_unused_ntp_cost: float = 0.02
 
-    # v6/v7: penalize voluntarily stopping while productive capacity remains.
+    # v6/v8: penalize voluntarily stopping while productive capacity remains.
     # This makes endpoint control state-dependent rather than rewarding the first legal stop.
     stop_unused_capacity_penalty: float = 1.25
 
@@ -225,7 +225,7 @@ class IVTVectorEnv:
     @staticmethod
     def action_index(ntp_level: int, mg_level: int, stop: int = 0) -> int:
         # Backwards-compatible helper used by the baselines.
-        # In v7, stop is a dedicated action and no longer carries feed levels.
+        # In v8, stop is a dedicated action and no longer carries feed levels.
         if stop:
             return 9
         return ntp_level * 3 + mg_level
@@ -462,7 +462,7 @@ class IVTVectorEnv:
             - cfg.penalty_ntp_high * ntp_high_stress
         )
 
-        # v7: stop is a dedicated action. The environment still guards against
+        # v8: stop is a dedicated action. The environment still guards against
         # early external stop actions, while PPO masks them before sampling.
         can_stop = self.step_count >= cfg.min_stop_step
         effective_stop = stop_signal & can_stop
