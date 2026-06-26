@@ -2,7 +2,7 @@
 """
 Experiment 1: PPO for lightweight IVT fed-batch control.
 
-Version 5 changes:
+Version 6 changes:
 - Retains the v5 10-action space with a dedicated masked stop action.
 - Softens Mg feed costs so PPO is more willing to use Mg when it is limiting.
 - Adds a terminal unused-capacity penalty for voluntary stopping while enzyme/substrate capacity remains.
@@ -92,7 +92,7 @@ class EnvConfig:
     alpha_yield: float = 1.0
     cost_ntp: float = 0.050
     cost_mg: float = 0.025
-    cost_time: float = 0.002
+    cost_time: float = 0.0005
     penalty_stress: float = 0.035
 
     # Terminal reward.
@@ -100,9 +100,9 @@ class EnvConfig:
     terminal_ntp_cost: float = 0.05
     terminal_mg_cost: float = 0.035
 
-    # v5 change: penalize voluntarily stopping while productive capacity remains.
+    # v6 change: penalize voluntarily stopping while productive capacity remains.
     # This makes endpoint control state-dependent rather than rewarding the first legal stop.
-    stop_unused_capacity_penalty: float = 0.75
+    stop_unused_capacity_penalty: float = 1.25
 
     lambda_ppi_quality: float = 0.15
     lambda_mgppi_quality: float = 0.60
@@ -117,7 +117,7 @@ class PPOConfig:
     ppo_epochs: int = 4
     minibatches: int = 8
     learning_rate: float = 3e-4
-    gamma: float = 0.99
+    gamma: float = 1.0
     gae_lambda: float = 0.95
     clip_eps: float = 0.20
     entropy_coef: float = 0.010
@@ -217,7 +217,7 @@ class IVTVectorEnv:
     @staticmethod
     def action_index(ntp_level: int, mg_level: int, stop: int = 0) -> int:
         # Backwards-compatible helper used by the baselines.
-        # In v5, stop is a dedicated action and no longer carries feed levels.
+        # In v6, stop is a dedicated action and no longer carries feed levels.
         if stop:
             return 9
         return ntp_level * 3 + mg_level
@@ -451,7 +451,7 @@ class IVTVectorEnv:
             - cfg.penalty_stress * stress
         )
 
-        # v5: stop is a dedicated action. The environment still guards against
+        # v6: stop is a dedicated action. The environment still guards against
         # early external stop actions, while PPO masks them before sampling.
         can_stop = self.step_count >= cfg.min_stop_step
         effective_stop = stop_signal & can_stop
