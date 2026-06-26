@@ -2,7 +2,7 @@
 """
 Experiment 1: PPO for lightweight IVT fed-batch control.
 
-Version 8 sweep changes:
+Version 8 changes:
 - Retains the v5 10-action space with a dedicated masked stop action.
 - Softens Mg feed costs so PPO is more willing to use Mg when it is limiting.
 - Adds a terminal unused-capacity penalty for voluntary stopping while enzyme/substrate capacity remains.
@@ -12,13 +12,13 @@ Dependencies:
     pip install torch numpy matplotlib
 
 Smoke test:
-    python experiment1.py --mode smoke
+    python experiment1_sweep.py --mode smoke
 
 MacBook Air:
-    python experiment1.py --mode all --total-steps 1500000 --num-envs 128 --device cpu
+    python experiment1_sweep.py --mode all --total-steps 1500000 --num-envs 128 --device cpu
 
 GTX 1080 Ti:
-    python experiment1.py --mode all --total-steps 3000000 --num-envs 512 --device cuda
+    python experiment1_sweep.py --mode all --total-steps 3000000 --num-envs 512 --device cuda
 """
 
 from __future__ import annotations
@@ -1228,7 +1228,7 @@ def main() -> None:
     )
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--out-dir", type=str, default="ivt_experiment1_outputs")
+    parser.add_argument("--out-dir", type=str, default="ivt_experiment1_sweep")
 
     parser.add_argument("--total-steps", type=int, default=1_000_000)
     parser.add_argument("--num-envs", type=int, default=512)
