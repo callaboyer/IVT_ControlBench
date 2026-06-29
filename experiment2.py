@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Experiment 2: PPO under IVT PAT observability constraints.
+Experiment 2: PPO under IVT PAT observability constraints, with corrected oracle observation.
 
 Experiment 2 changes:
 - Retains the v8 10-action space with a dedicated masked stop action.
@@ -12,13 +12,13 @@ Dependencies:
     pip install torch numpy matplotlib
 
 Smoke test:
-    python experiment2_ivt_pat_observability.py --mode smoke
+    python experiment2_ivt_pat_observability_fixed_oracle.py --mode smoke
 
 MacBook Air:
-    python experiment2_ivt_pat_observability.py --mode all --total-steps 1500000 --num-envs 128 --device cpu
+    python experiment2_ivt_pat_observability_fixed_oracle.py --mode all --total-steps 1500000 --num-envs 128 --device cpu
 
 GTX 1080 Ti:
-    python experiment2_ivt_pat_observability.py --mode all --total-steps 3000000 --num-envs 512 --device cuda
+    python experiment2_ivt_pat_observability_fixed_oracle.py --mode all --total-steps 3000000 --num-envs 512 --device cuda
 """
 
 from __future__ import annotations
@@ -229,8 +229,10 @@ class IVTVectorEnv:
 
     @staticmethod
     def _obs_dim_for_mode(obs_mode: str) -> int:
+        # Corrected oracle now includes full state plus feed history/cumulative feed.
+        # This makes oracle a fair information upper bound relative to PAT modes.
         if obs_mode == "oracle":
-            return 9
+            return 13
         if obs_mode == "cheap_pat":
             return 7
         if obs_mode in {"delayed_atline", "noisy_missing"}:
@@ -345,6 +347,9 @@ class IVTVectorEnv:
         time_norm = self.step_count.float() / cfg.horizon
 
         if cfg.obs_mode == "oracle":
+            total_ntp_scale = cfg.horizon * cfg.ntp_high_feed + 1e-8
+            total_mg_scale = cfg.horizon * cfg.mg_high_feed + 1e-8
+
             obs = torch.stack(
                 [
                     s[:, self.NTP] / cfg.max_ntp,
@@ -355,6 +360,10 @@ class IVTVectorEnv:
                     s[:, self.RNA_TRUNC] / cfg.max_rna,
                     s[:, self.ENZYME] / 1.30,
                     (s[:, self.PH] - cfg.ph_optimum) / 1.0,
+                    self.prev_ntp_feed / (cfg.ntp_high_feed + 1e-8),
+                    self.prev_mg_feed / (cfg.mg_high_feed + 1e-8),
+                    self.total_ntp_fed / total_ntp_scale,
+                    self.total_mg_fed / total_mg_scale,
                     time_norm,
                 ],
                 dim=-1,
@@ -1371,7 +1380,7 @@ def main() -> None:
     )
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--out-dir", type=str, default="ivt_experiment2_outputs")
+    parser.add_argument("--out-dir", type=str, default="ivt_experiment2_outputs_fixed_oracle")
 
     parser.add_argument(
         "--obs-mode",
